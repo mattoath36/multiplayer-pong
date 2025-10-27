@@ -1,0 +1,4 @@
+{
+  "name": "party-pong",
+  "main": "server.ts"
+}
