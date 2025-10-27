@@ -31,7 +31,7 @@ export default function App() {
     message: "Waiting for opponent...",
   });
 
-  const [chat, setChat] = useState<{ name: string; text: string }[]>([]);
+const [chat, setChat] = useState<{ id: string; name: string; text: string; ts?: number }[]>([]);
   const [input, setInput] = useState("");
 
   const lobby = useRef<PartySocket | null>(null);
