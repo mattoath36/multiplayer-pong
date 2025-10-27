@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import PartySocket from "partysocket";
 
 const HOST = import.meta.env.VITE_PARTYKIT_HOST || "localhost:1999";
@@ -126,8 +126,10 @@ export default function App() {
 
       setGame((g) => {
         const newP = [...g.paddles] as [number, number];
-        if (keys.up) newP[me.current] -= 6;
-        if (keys.down) newP[me.current] += 6;
+        if (me.current !== null) {
+  if (keys.up) newP[me.current] -= 6;
+  if (keys.down) newP[me.current] += 6;
+}
         const updated = { ...g, paddles: newP };
         match.current?.send(
           JSON.stringify({ type: "relay", payload: { paddles: newP } })
