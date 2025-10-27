@@ -1,292 +1,265 @@
 import { useEffect, useRef, useState } from "react";
 import PartySocket from "partysocket";
 
-const HOST = import.meta.env.VITE_PARTYKIT_HOST || "localhost:1999";
+// PartyKit host injected by Netlify environment variable
+const HOST = import.meta.env.VITE_PARTYKIT_HOST as string;
+const WIDTH = 800;
+const HEIGHT = 600;
+const PADDLE_H = 80;
+const BALL_SIZE = 10;
 
-const WIDTH = 600;
-const HEIGHT = 400;
-const PADDLE_H = 60;
-const PADDLE_W = 10;
-const BALL_R = 8;
-
-interface Ball {
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
+// linear interpolation helper
+function lerp(a: number, b: number, t: number) {
+  return a + (b - a) * t;
 }
+
 interface GameState {
   paddles: [number, number];
-  ball: Ball;
+  ball: { x: number; y: number; vx: number; vy: number };
   scores: [number, number];
-  status: "waiting" | "playing" | "over";
-  message: string;
+  status: "waiting" | "playing" | "gameover";
+  message?: string;
 }
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const lobby = useRef<PartySocket | null>(null);
-  const match = useRef<PartySocket | null>(null);
-  const me = useRef<0 | 1 | null>(null);
-
   const [game, setGame] = useState<GameState>({
     paddles: [HEIGHT / 2 - PADDLE_H / 2, HEIGHT / 2 - PADDLE_H / 2],
     ball: { x: WIDTH / 2, y: HEIGHT / 2, vx: 4, vy: 3 },
     scores: [0, 0],
     status: "waiting",
-    message: "Connecting...",
+    message: "Waiting for opponent...",
   });
 
   const [chat, setChat] = useState<{ name: string; text: string }[]>([]);
   const [input, setInput] = useState("");
 
-  // --- Connect to lobby (run once) ---
+  const lobby = useRef<PartySocket | null>(null);
+  const match = useRef<PartySocket | null>(null);
+  const me = useRef<number | null>(null);
+  const opponentRef = useRef<number | null>(null);
+
+  const networkPaddles = useRef<[number, number] | null>(null);
+  const lastSent = useRef<number | null>(null);
+  const keys = useRef({ up: false, down: false });
+
+  // --- SETUP LOBBY CONNECTION ---
   useEffect(() => {
-    console.log("🛰 Connecting to:", HOST);
     const s = new PartySocket({ host: HOST, room: "lobby" });
     lobby.current = s;
 
     s.addEventListener("open", () => {
-      console.log("✅ Connected to lobby");
-      setGame((g) => ({ ...g, message: "Waiting for an opponent..." }));
+      console.log("🛰 Connected to lobby");
     });
 
-    s.addEventListener("message", (e) => {
-      const data = JSON.parse(e.data);
-      if (data.type === "matchStart") {
-        me.current = data.youAre;
-        joinMatch(data.matchId);
-      } else if (data.type === "status") {
+    s.addEventListener("message", (event) => {
+      const data = JSON.parse(event.data);
+      if (data.type === "status") {
         setGame((g) => ({ ...g, message: data.message }));
+      }
+      if (data.type === "matchStart") {
+        const { matchId, youAre } = data;
+        console.log("🎮 Match starting:", matchId, "You are:", youAre);
+        me.current = youAre;
+        opponentRef.current = youAre === 0 ? 1 : 0;
+
+        const ms = new PartySocket({ host: HOST, room: matchId });
+        match.current = ms;
+
+        setGame((g) => ({ ...g, status: "playing", message: undefined }));
+
+        ms.addEventListener("message", (e) => {
+          const d = JSON.parse(e.data);
+
+          if (d.type === "relay" && d.payload?.paddles) {
+            networkPaddles.current = d.payload.paddles;
+          }
+
+          if (d.type === "relay" && d.payload?.ball) {
+            setGame((g) => ({ ...g, ball: d.payload.ball }));
+          }
+
+          if (d.type === "chat") {
+            setChat((prev) => [...prev, d.message]);
+          }
+
+          if (d.type === "gameOver") {
+            setGame((g) => ({
+              ...g,
+              status: "gameover",
+              message: `${d.reason}, final score ${d.finalScore}`,
+            }));
+          }
+        });
       }
     });
 
     return () => s.close();
   }, []);
 
-  // --- Join match ---
-  function joinMatch(id: string) {
-    console.log("🎮 Joining match:", id);
-    const ms = new PartySocket({ host: HOST, room: id });
-    match.current = ms;
-    setGame((g) => ({
-      ...g,
-      status: "playing",
-      message: "Match started! Use ↑/↓ to move.",
-    }));
-
-    ms.addEventListener("open", () =>
-      console.log("✅ Connected to match:", id)
-    );
-
-    ms.addEventListener("message", (e) => {
-      const data = JSON.parse(e.data);
-
-      if (data.type === "relay" && data.payload) {
-        setGame((g) => ({ ...g, ...data.payload }));
-      }
-
-      if (data.type === "chat") {
-        setChat((c) => [...c, data.message]);
-      }
-
-      if (data.type === "gameOver") {
-        setGame((g) => ({
-          ...g,
-          status: "over",
-          message: `${data.reason}, final score ${data.finalScore || "N/A"}`,
-        }));
-      }
-    });
-
-    ms.addEventListener("close", () => {
-      setGame((g) => ({
-        ...g,
-        status: "over",
-        message: "Connection lost.",
-      }));
-    });
-  }
-
-  // --- Keyboard controls (run once) ---
+  // --- INPUT HANDLING ---
   useEffect(() => {
-    const keys = { up: false, down: false };
     const onKey = (e: KeyboardEvent) => {
-      if (game.status !== "playing" || me.current === null) return;
+      if (me.current === null || game.status !== "playing") return;
       const isDown = e.type === "keydown";
-      if (e.key === "ArrowUp") keys.up = isDown;
-      if (e.key === "ArrowDown") keys.down = isDown;
+      if (e.key === "ArrowUp") keys.current.up = isDown;
+      if (e.key === "ArrowDown") keys.current.down = isDown;
     };
 
     window.addEventListener("keydown", onKey);
     window.addEventListener("keyup", onKey);
 
-    const interval = setInterval(() => {
-      if (me.current === null || game.status !== "playing") return;
-
-      setGame((g) => {
-        const newP = [...g.paddles] as [number, number];
-        if (me.current !== null) {
-  if (keys.up) newP[me.current] -= 6;
-  if (keys.down) newP[me.current] += 6;
-}
-        const updated = { ...g, paddles: newP };
-        match.current?.send(
-          JSON.stringify({ type: "relay", payload: { paddles: newP } })
-        );
-        return updated;
-      });
-    }, 16);
-
     return () => {
-      clearInterval(interval);
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("keyup", onKey);
     };
   }, [game.status]);
 
-  // --- Game physics loop (hosted on player 0) ---
+  // --- GAME LOOP ---
   useEffect(() => {
-    if (me.current !== 0) return; // only player 0 drives ball
-    const loop = setInterval(() => {
-      setGame((g) => {
-        if (g.status !== "playing") return g;
-        let { ball, paddles, scores } = g;
-        let { x, y, vx, vy } = ball;
+    let frame: number;
 
-        x += vx;
-        y += vy;
+    const loop = () => {
+      if (game.status === "playing") {
+        setGame((g) => {
+          const newP = [...g.paddles] as [number, number];
+          const newBall = { ...g.ball };
+          const myIndex = me.current;
+          const oppIndex = opponentRef.current;
 
-        if (y < BALL_R || y > HEIGHT - BALL_R) vy *= -1;
+          // LOCAL MOVEMENT (instant + clamp)
+          if (myIndex !== null) {
+            if (keys.current.up) newP[myIndex] -= 6;
+            if (keys.current.down) newP[myIndex] += 6;
+            newP[myIndex] = Math.max(0, Math.min(HEIGHT - PADDLE_H, newP[myIndex]));
 
-        // Paddle collisions
-        if (
-          x < 20 + PADDLE_W &&
-          y > paddles[0] &&
-          y < paddles[0] + PADDLE_H &&
-          vx < 0
-        )
-          vx *= -1;
+            // Send paddle updates ~20fps
+            const now = Date.now();
+            if (!lastSent.current || now - lastSent.current > 50) {
+              lastSent.current = now;
+              match.current?.send(
+                JSON.stringify({ type: "relay", payload: { paddles: newP } })
+              );
+            }
+          }
 
-        if (
-          x > WIDTH - 20 - PADDLE_W &&
-          y > paddles[1] &&
-          y < paddles[1] + PADDLE_H &&
-          vx > 0
-        )
-          vx *= -1;
+          // REMOTE SMOOTHING
+          if (oppIndex !== null && networkPaddles.current) {
+            const target = networkPaddles.current[oppIndex];
+            newP[oppIndex] = lerp(g.paddles[oppIndex], target, 0.2);
+          }
 
-        // Score conditions
-        if (x < 0) {
-          scores = [scores[0], scores[1] + 1];
-          x = WIDTH / 2;
-          y = HEIGHT / 2;
-          vx = 4;
-        }
-        if (x > WIDTH) {
-          scores = [scores[0] + 1, scores[1]];
-          x = WIDTH / 2;
-          y = HEIGHT / 2;
-          vx = -4;
-        }
+          // BALL PHYSICS (host only)
+          if (myIndex === 0) {
+            newBall.x += newBall.vx;
+            newBall.y += newBall.vy;
 
-        const newState = {
-          ...g,
-          ball: { x, y, vx, vy },
-          scores,
-        };
-        match.current?.send(
-          JSON.stringify({ type: "relay", payload: newState })
-        );
-        return newState;
-      });
-    }, 16);
+            if (newBall.y < 0 || newBall.y > HEIGHT - BALL_SIZE) {
+              newBall.vy *= -1;
+            }
 
-    return () => clearInterval(loop);
+            // Paddle collisions
+            if (
+              newBall.x < 20 &&
+              newBall.y > newP[0] &&
+              newBall.y < newP[0] + PADDLE_H
+            ) {
+              newBall.vx *= -1;
+            }
+            if (
+              newBall.x > WIDTH - 30 &&
+              newBall.y > newP[1] &&
+              newBall.y < newP[1] + PADDLE_H
+            ) {
+              newBall.vx *= -1;
+            }
+
+            // Send ball updates occasionally
+            if (!lastSent.current || Date.now() - lastSent.current > 50) {
+              match.current?.send(
+                JSON.stringify({ type: "relay", payload: { ball: newBall } })
+              );
+            }
+          }
+
+          return { ...g, paddles: newP, ball: newBall };
+        });
+      }
+      draw();
+      frame = requestAnimationFrame(loop);
+    };
+
+    const draw = () => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+
+      ctx.fillStyle = "black";
+      ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+      ctx.fillStyle = "white";
+      ctx.fillRect(10, game.paddles[0], 10, PADDLE_H);
+      ctx.fillRect(WIDTH - 20, game.paddles[1], 10, PADDLE_H);
+
+      ctx.beginPath();
+      ctx.arc(game.ball.x, game.ball.y, BALL_SIZE, 0, Math.PI * 2);
+      ctx.fill();
+    };
+
+    frame = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(frame);
   }, [game.status]);
 
-  // --- Draw frame ---
-  useEffect(() => {
-    const ctx = canvasRef.current?.getContext("2d");
-    if (!ctx) return;
-    ctx.fillStyle = "black";
-    ctx.fillRect(0, 0, WIDTH, HEIGHT);
-    ctx.fillStyle = "white";
-    // paddles
-    ctx.fillRect(10, game.paddles[0], PADDLE_W, PADDLE_H);
-    ctx.fillRect(WIDTH - 20, game.paddles[1], PADDLE_W, PADDLE_H);
-    // ball
-    ctx.beginPath();
-    ctx.arc(game.ball.x, game.ball.y, BALL_R, 0, Math.PI * 2);
-    ctx.fill();
-    // score
-    ctx.font = "20px Arial";
-    ctx.fillText(game.scores[0].toString(), WIDTH * 0.25, 30);
-    ctx.fillText(game.scores[1].toString(), WIDTH * 0.75, 30);
-  }, [game]);
-
-  // --- Chat ---
-  function sendChat() {
+  // --- CHAT ---
+  const sendChat = () => {
     if (!input.trim()) return;
-    const msg = {
-      id: crypto.randomUUID(),
-      name: `P${me.current ?? "?"}`,
-      text: input,
-      ts: Date.now(),
-    };
+    const msg = { id: crypto.randomUUID(), name: "Player", text: input, ts: Date.now() };
+    setChat((prev) => [...prev, msg]);
     match.current?.send(JSON.stringify({ type: "chat", message: msg }));
-    setChat((c) => [...c, msg]);
     setInput("");
-  }
+  };
 
   return (
-    <div className="flex flex-col items-center justify-center h-screen bg-gray-900 text-white relative">
-      <h1 className="text-2xl mb-2">🏓 Party Pong</h1>
-      <p className="mb-4">{game.message}</p>
-
+    <div className="flex flex-col items-center justify-center h-screen bg-gray-900 text-white gap-3">
       <canvas
         ref={canvasRef}
         width={WIDTH}
         height={HEIGHT}
-        className="border border-gray-600 bg-black"
-      ></canvas>
-
-      {/* Chat */}
-      <div className="mt-4 w-96 bg-gray-800 rounded-xl p-2 flex flex-col h-40">
-        <div className="flex-1 overflow-y-auto text-sm">
-          {chat.map((c, i) => (
-            <div key={i}>
-              <span className="font-bold">{c.name}:</span> {c.text}
-            </div>
-          ))}
-        </div>
-        <div className="flex mt-2">
-          <input
-            className="flex-1 bg-gray-700 p-1 rounded-l text-sm"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Say hi or drop an emoji…"
-          />
-          <button
-            className="bg-white text-black px-3 rounded-r"
-            onClick={sendChat}
-          >
-            Send
-          </button>
-        </div>
+        className="border border-gray-700 rounded"
+      />
+      <div className="text-center text-lg font-mono">
+        {game.message && <p>{game.message}</p>}
       </div>
-
-      {game.status === "over" && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/70 text-white text-2xl">
-          <p>{game.message}</p>
-          <button
-            className="mt-4 bg-white text-black px-4 py-2 rounded-xl"
-            onClick={() => window.location.reload()}
-          >
-            Back to Lobby
-          </button>
-        </div>
+      {game.status === "gameover" && (
+        <button
+          className="bg-blue-500 px-4 py-2 rounded"
+          onClick={() => window.location.reload()}
+        >
+          Rematch
+        </button>
       )}
+      <div className="flex gap-2 mt-4">
+        <input
+          className="bg-gray-800 border border-gray-700 rounded px-2 py-1 w-64"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="Send emoji or chat..."
+        />
+        <button
+          className="bg-green-600 px-3 py-1 rounded"
+          onClick={sendChat}
+        >
+          Send
+        </button>
+      </div>
+      <div className="mt-2 w-80 h-32 overflow-y-auto text-sm text-left bg-gray-800 rounded p-2 border border-gray-700">
+        {chat.map((c) => (
+          <p key={c.id}>
+            <b>{c.name}:</b> {c.text}
+          </p>
+        ))}
+      </div>
     </div>
   );
 }
