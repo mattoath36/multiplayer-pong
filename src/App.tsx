@@ -1,11 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import PartySocket from "partysocket";
 
-// PartyKit host injected by Netlify environment variable
 const HOST = import.meta.env.VITE_PARTYKIT_HOST as string;
 const WIDTH = 800;
 const HEIGHT = 600;
-const PADDLE_H = 80;
+const PADDLE_HEIGHT = 80;
 const BALL_SIZE = 10;
 
 // linear interpolation helper
@@ -24,52 +23,53 @@ interface GameState {
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [game, setGame] = useState<GameState>({
-    paddles: [HEIGHT / 2 - PADDLE_H / 2, HEIGHT / 2 - PADDLE_H / 2],
+    paddles: [HEIGHT / 2 - PADDLE_HEIGHT / 2, HEIGHT / 2 - PADDLE_HEIGHT / 2],
     ball: { x: WIDTH / 2, y: HEIGHT / 2, vx: 4, vy: 3 },
     scores: [0, 0],
     status: "waiting",
     message: "Waiting for opponent...",
   });
 
-const [chat, setChat] = useState<{ id: string; name: string; text: string; ts?: number }[]>([]);
+  const [chat, setChat] = useState<
+    { id: string; name: string; text: string; ts?: number }[]
+  >([]);
   const [input, setInput] = useState("");
 
   const lobby = useRef<PartySocket | null>(null);
   const match = useRef<PartySocket | null>(null);
   const me = useRef<number | null>(null);
-  const opponentRef = useRef<number | null>(null);
+  const opponent = useRef<number | null>(null);
 
-  const networkPaddles = useRef<[number, number] | null>(null);
-  const lastSent = useRef<number | null>(null);
   const keys = useRef({ up: false, down: false });
+  const networkPaddles = useRef<[number, number] | null>(null);
+  const lastSent = useRef<number>(0);
 
-  // --- SETUP LOBBY CONNECTION ---
+  // --- CONNECT TO LOBBY ---
   useEffect(() => {
     const s = new PartySocket({ host: HOST, room: "lobby" });
     lobby.current = s;
 
-    s.addEventListener("open", () => {
-      console.log("🛰 Connected to lobby");
-    });
+    s.addEventListener("open", () => console.log("🛰 Connected to lobby"));
 
-    s.addEventListener("message", (event) => {
-      const data = JSON.parse(event.data);
+    s.addEventListener("message", (e) => {
+      const data = JSON.parse(e.data);
+
       if (data.type === "status") {
         setGame((g) => ({ ...g, message: data.message }));
       }
+
       if (data.type === "matchStart") {
         const { matchId, youAre } = data;
         console.log("🎮 Match starting:", matchId, "You are:", youAre);
         me.current = youAre;
-        opponentRef.current = youAre === 0 ? 1 : 0;
+        opponent.current = youAre === 0 ? 1 : 0;
 
         const ms = new PartySocket({ host: HOST, room: matchId });
         match.current = ms;
-
         setGame((g) => ({ ...g, status: "playing", message: undefined }));
 
-        ms.addEventListener("message", (e) => {
-          const d = JSON.parse(e.data);
+        ms.addEventListener("message", (event) => {
+          const d = JSON.parse(event.data);
 
           if (d.type === "relay" && d.payload?.paddles) {
             networkPaddles.current = d.payload.paddles;
@@ -125,17 +125,17 @@ const [chat, setChat] = useState<{ id: string; name: string; text: string; ts?: 
           const newP = [...g.paddles] as [number, number];
           const newBall = { ...g.ball };
           const myIndex = me.current;
-          const oppIndex = opponentRef.current;
+          const oppIndex = opponent.current;
 
-          // LOCAL MOVEMENT (instant + clamp)
+          // LOCAL MOVEMENT + CLAMP
           if (myIndex !== null) {
             if (keys.current.up) newP[myIndex] -= 6;
             if (keys.current.down) newP[myIndex] += 6;
-            newP[myIndex] = Math.max(0, Math.min(HEIGHT - PADDLE_H, newP[myIndex]));
+            newP[myIndex] = Math.max(0, Math.min(HEIGHT - PADDLE_HEIGHT, newP[myIndex]));
 
-            // Send paddle updates ~20fps
+            // Send updates to server at ~20 fps
             const now = Date.now();
-            if (!lastSent.current || now - lastSent.current > 50) {
+            if (now - lastSent.current > 50) {
               lastSent.current = now;
               match.current?.send(
                 JSON.stringify({ type: "relay", payload: { paddles: newP } })
@@ -143,13 +143,13 @@ const [chat, setChat] = useState<{ id: string; name: string; text: string; ts?: 
             }
           }
 
-          // REMOTE SMOOTHING
+          // REMOTE SMOOTHING (lerp toward opponent’s last known pos)
           if (oppIndex !== null && networkPaddles.current) {
             const target = networkPaddles.current[oppIndex];
             newP[oppIndex] = lerp(g.paddles[oppIndex], target, 0.2);
           }
 
-          // BALL PHYSICS (host only)
+          // BALL PHYSICS (player 0 controls)
           if (myIndex === 0) {
             newBall.x += newBall.vx;
             newBall.y += newBall.vy;
@@ -158,33 +158,30 @@ const [chat, setChat] = useState<{ id: string; name: string; text: string; ts?: 
               newBall.vy *= -1;
             }
 
-            // Paddle collisions
             if (
               newBall.x < 20 &&
               newBall.y > newP[0] &&
-              newBall.y < newP[0] + PADDLE_H
+              newBall.y < newP[0] + PADDLE_HEIGHT
             ) {
               newBall.vx *= -1;
             }
             if (
               newBall.x > WIDTH - 30 &&
               newBall.y > newP[1] &&
-              newBall.y < newP[1] + PADDLE_H
+              newBall.y < newP[1] + PADDLE_HEIGHT
             ) {
               newBall.vx *= -1;
             }
 
-            // Send ball updates occasionally
-            if (!lastSent.current || Date.now() - lastSent.current > 50) {
-              match.current?.send(
-                JSON.stringify({ type: "relay", payload: { ball: newBall } })
-              );
-            }
+            match.current?.send(
+              JSON.stringify({ type: "relay", payload: { ball: newBall } })
+            );
           }
 
           return { ...g, paddles: newP, ball: newBall };
         });
       }
+
       draw();
       frame = requestAnimationFrame(loop);
     };
@@ -199,8 +196,8 @@ const [chat, setChat] = useState<{ id: string; name: string; text: string; ts?: 
       ctx.fillRect(0, 0, WIDTH, HEIGHT);
 
       ctx.fillStyle = "white";
-      ctx.fillRect(10, game.paddles[0], 10, PADDLE_H);
-      ctx.fillRect(WIDTH - 20, game.paddles[1], 10, PADDLE_H);
+      ctx.fillRect(10, game.paddles[0], 10, PADDLE_HEIGHT);
+      ctx.fillRect(WIDTH - 20, game.paddles[1], 10, PADDLE_HEIGHT);
 
       ctx.beginPath();
       ctx.arc(game.ball.x, game.ball.y, BALL_SIZE, 0, Math.PI * 2);
@@ -228,9 +225,8 @@ const [chat, setChat] = useState<{ id: string; name: string; text: string; ts?: 
         height={HEIGHT}
         className="border border-gray-700 rounded"
       />
-      <div className="text-center text-lg font-mono">
-        {game.message && <p>{game.message}</p>}
-      </div>
+      {game.message && <p className="text-lg font-mono">{game.message}</p>}
+
       {game.status === "gameover" && (
         <button
           className="bg-blue-500 px-4 py-2 rounded"
@@ -239,6 +235,7 @@ const [chat, setChat] = useState<{ id: string; name: string; text: string; ts?: 
           Rematch
         </button>
       )}
+
       <div className="flex gap-2 mt-4">
         <input
           className="bg-gray-800 border border-gray-700 rounded px-2 py-1 w-64"
@@ -246,13 +243,11 @@ const [chat, setChat] = useState<{ id: string; name: string; text: string; ts?: 
           onChange={(e) => setInput(e.target.value)}
           placeholder="Send emoji or chat..."
         />
-        <button
-          className="bg-green-600 px-3 py-1 rounded"
-          onClick={sendChat}
-        >
+        <button className="bg-green-600 px-3 py-1 rounded" onClick={sendChat}>
           Send
         </button>
       </div>
+
       <div className="mt-2 w-80 h-32 overflow-y-auto text-sm text-left bg-gray-800 rounded p-2 border border-gray-700">
         {chat.map((c) => (
           <p key={c.id}>
